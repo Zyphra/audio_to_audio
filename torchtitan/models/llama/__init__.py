@@ -58,3 +58,15 @@ llama3_configs = {
         rope_theta=500000,
     ),
 }
+
+zatam_configs = {
+    "3B": ModelArgs(
+        dim=3072,
+        n_layers=28,
+        n_heads=24,
+        n_kv_heads=8,
+        ffn_dim_multiplier=1.3,
+        multiple_of=1024,
+        rope_theta=500000,
+    ),
+}
