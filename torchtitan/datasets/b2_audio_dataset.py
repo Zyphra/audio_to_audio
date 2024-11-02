@@ -6,9 +6,9 @@ import tempfile
 from torch.utils.data import Dataset, DataLoader
 from botocore.exceptions import ClientError
 from torch.utils.data._utils.collate import default_collate
-import torchaudio
 import bisect
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
 load_dotenv()
 
 B2_ACCESS_KEY_ID = os.getenv("B2_ACCESS_KEY_ID")
@@ -89,9 +89,8 @@ def get_words_before(timestamp, x, data):
     words_before = all_words[start_idx:idx]
     return words_before
 
-# Custom Dataset class
 class B2AudioDataset(Dataset):
-    def __init__(self, block_size, context_split_index):
+    def __init__(self, tokenizer, block_size, context_split_index=1024, samples_per_audio_token=192, sample_rate=44_000):
         self.block_size = block_size
         self.transcripts = self.list_in_b2('top300uspods_transcriptions/', '.json')
         self.tokenized_audio = self.list_in_b2('top300uspods_tokenized/', '.npy')
@@ -103,8 +102,10 @@ class B2AudioDataset(Dataset):
             aws_access_key_id=B2_ACCESS_KEY_ID,
             aws_secret_access_key=B2_SECRET_ACCESS_KEY,
         )
-        self.context_split_index = context_split_index
-        self.samples_per_audio_token = 192
+        self.context_split_index = context_split_index # index of the first audio token
+        self.samples_per_audio_token = samples_per_audio_token
+        self.sample_rate = sample_rate
+        self.tokenizer = tokenizer
 
     '''
     def list_audio_files_in_b2(self):
@@ -164,15 +165,29 @@ class B2AudioDataset(Dataset):
         try:
             self.s3_client.download_file(Bucket=B2_BUCKET_NAME, Key=tokens_s3_key, Filename=temp_tokens_path)
             self.s3_client.download_file(Bucket=B2_BUCKET_NAME, Key=transcript_s3_key, Filename=temp_transcript_path)
+
+            audio_tokens = np.load(temp_tokens_path)
+            start_index = np.random.randint(0, len(audio_tokens) - (self.block_size-self.context_split_index+2))
+            selected_audio_tokens = audio_tokens[start_index : start_index + self.block_size-self.context_split_index]
+            selected_audio_tokens = torch.tensor(selected_audio_tokens)
+
             with open(temp_transcript_path, 'r') as file:
                 transcript = json.load(file)
-            tokens = np.load(temp_tokens_path)
-            start_index = np.random.randint(0, len(array) - (self.block_size-self.context_split_index+2))
-            selected_audio_tokens = array[start_index : start_index + self.block_size-self.context_split_index]
-            selected_audio_tokens = torch.tensor(selected_audio_tokens)
-            #x_words_before_audio_start = get_words_before(timestamp, x, data)
-            x = tokens[:-1]  # inputs
-            y = tokens[1:]   # targets
+            words_before_audio_start = get_words_before((start_inx*self.samples_per_audio_token)/self.sample_rate, 100_000, transcript) # high value for x to get all words
+            words_before_audio_start = " ".join(words_before_audio_start)
+            word_tokens = self.tokenizer.encode(words_before_audio_start, bos=False, eos=False)
+
+            #torch.cat(torch.tensor(word_tokens[len(word_tokens)-self.:]), selected_audio_tokens)
+            if len(word_tokens) > self.context_split_index:
+                word_tokens = word_tokens[self.context_split_index:]
+            else:
+                padding_length = self.context_split_index - len(word_tokens)
+                word_tokens += [self.tokenizer.pad_token_id] * padding_length
+            word_tokens = torch.tensor(word_tokens, dtype=torch.long)
+            tokens = torch.cat([word_tokens, selected_audio_tokens], dim=0)
+
+            x = tokens[:-1] # inputs
+            y = tokens[1:] # targets
             return x, y
         except Exception as e:
             print(f"Error downloading {s3_key}: {e}")
